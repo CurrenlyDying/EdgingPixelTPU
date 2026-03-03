@@ -120,9 +120,8 @@ public class DaemonService extends Service {
             OutputStream out = sock.getOutputStream();
 
             while (true) {
-                int msgType = in.readInt();
-                msgType = Integer.reverseBytes(msgType);
-                int length = Integer.reverseBytes(in.readInt());
+                int msgType = Integer.reverseBytes(in.readInt());
+                int length  = Integer.reverseBytes(in.readInt());
 
                 if (length < 0 || length > 256 * 1024 * 1024) {
                     sendError(out, "payload too large");
@@ -134,43 +133,13 @@ public class DaemonService extends Service {
                 ByteBuffer buf = ByteBuffer.wrap(payload).order(ByteOrder.LITTLE_ENDIAN);
 
                 switch (msgType) {
-
-                    case MSG_PING: {
-                        String r = "PHANTOM_NPU_OK";
-                        sendMsg(out, MSG_PONG, r.getBytes());
-                        break;
-                    }
-
-                    case MSG_LOAD: {
-                        handleLoad(buf, out);
-                        break;
-                    }
-
-                    case MSG_INFER: {
-                        handleInfer(buf, out);
-                        break;
-                    }
-
-                    case MSG_BENCH: {
-                        handleBench(buf, out);
-                        break;
-                    }
-
-                    case MSG_UNLOAD: {
-                        int sid = buf.getInt();
-                        SessionState s = sessions.remove(sid);
-                        if (s != null) {
-                            try { s.model.close(); } catch (Exception ignored) {}
-                            sendAck(out);
-                            log("Unloaded session " + sid);
-                        } else {
-                            sendError(out, "unknown session");
-                        }
-                        break;
-                    }
-
+                    case MSG_PING:   handlePing(out);        break;
+                    case MSG_LOAD:   handleLoad(buf, out);   break;
+                    case MSG_INFER:  handleInfer(buf, out);  break;
+                    case MSG_BENCH:  handleBench(buf, out);  break;
+                    case MSG_UNLOAD: handleUnload(buf, out); break;
                     default:
-                        sendError(out, "unknown msg type");
+                        sendError(out, "unknown msg type 0x" + Integer.toHexString(msgType));
                         break;
                 }
             }
@@ -183,41 +152,98 @@ public class DaemonService extends Service {
         }
     }
 
+    // ── PING ──────────────────────────────────────────────────
+    private void handlePing(OutputStream out) throws IOException {
+        sendMsg(out, MSG_PONG, "PHANTOM_NPU_OK".getBytes());
+    }
+
+    // ── UNLOAD ────────────────────────────────────────────────
+    private void handleUnload(ByteBuffer buf, OutputStream out) throws IOException {
+        int sid = buf.getInt();
+        SessionState s = sessions.remove(sid);
+        if (s != null) {
+            try { s.model.close(); } catch (Exception ignored) {}
+            sendAck(out);
+            log("Unloaded session " + sid);
+        } else {
+            sendError(out, "unknown session " + sid);
+        }
+    }
+
     // ── LOAD ──────────────────────────────────────────────────
     private void handleLoad(ByteBuffer buf, OutputStream out) throws IOException {
         int nIn  = buf.getInt();
         int nOut = buf.getInt();
         if (nIn <= 0 || nOut <= 0 || nIn > 8 || nOut > 8) {
-            sendError(out, "bad counts"); return;
+            sendError(out, "bad tensor counts nIn=" + nIn + " nOut=" + nOut);
+            return;
         }
         long[] inSizes  = new long[nIn];
         long[] outSizes = new long[nOut];
         for (int i = 0; i < nIn;  i++) inSizes[i]  = buf.getLong();
         for (int i = 0; i < nOut; i++) outSizes[i] = buf.getLong();
         int blobLen = buf.getInt();
+        if (blobLen <= 0 || blobLen > 200 * 1024 * 1024) {
+            sendError(out, "bad blob size " + blobLen);
+            return;
+        }
         byte[] blob = new byte[blobLen];
         buf.get(blob);
 
-        log("Loading model " + blobLen / 1024 + " KB, " + nIn + " in / " + nOut + " out");
+        log("Loading model " + blobLen / 1024 + " KB, nIn=" + nIn + " nOut=" + nOut
+            + " inSize[0]=" + inSizes[0] + " outSize[0]=" + outSizes[0]);
 
+        File modelFile = null;
         try {
-            File modelFile = new File(getCacheDir(), "model_" + System.currentTimeMillis() + ".tflite");
+            // Write to cache
+            modelFile = new File(getCacheDir(), "model_" + System.currentTimeMillis() + ".tflite");
             try (FileOutputStream fos = new FileOutputStream(modelFile)) { fos.write(blob); }
+            log("Model written to: " + modelFile.getAbsolutePath() + " size=" + modelFile.length());
 
+            // Create LiteRT environment and options
             LiteRtEnvironment env = LiteRtEnvironment.create();
+            log("LiteRtEnvironment created: " + env);
+
             LiteRtOptions opts = new LiteRtOptions.Builder()
                 .setAccelerator(Accelerator.NPU)
                 .build();
+            log("LiteRtOptions: NPU accelerator set");
 
-            CompiledModel model = CompiledModel.create(
-                env,
-                modelFile.getAbsolutePath(),
-                opts
-            );
+            // Load and compile model
+            long loadStart = System.nanoTime();
+            CompiledModel model = CompiledModel.create(env, modelFile.getAbsolutePath(), opts);
+            long loadMs = (System.nanoTime() - loadStart) / 1_000_000;
+            log("CompiledModel.create() took " + loadMs + "ms, model=" + model);
 
+            // Verify model structure
+            int actualInputs  = model.getInputCount();
+            int actualOutputs = model.getOutputCount();
+            log("Model inputs=" + actualInputs + " outputs=" + actualOutputs);
+            if (actualInputs == 0 || actualOutputs == 0) {
+                sendError(out, "model reports 0 inputs or 0 outputs — compile may have failed");
+                return;
+            }
+
+            // Create I/O buffers
             CompiledModel.InputBuffers  ib = model.createInputBuffers(0);
             CompiledModel.OutputBuffers ob = model.createOutputBuffers(0);
+            log("I/O buffers created: ib=" + ib + " ob=" + ob);
 
+            // Warm-up run to force NPU program upload
+            log("Running warm-up inference...");
+            long warmStart = System.nanoTime();
+            model.run(ib, ob);
+            // Full drain: copy all output bytes to force DMA completion
+            for (int i = 0; i < nOut; i++) {
+                ByteBuffer tensor = ob.get(i);
+                tensor.rewind();
+                byte[] drain = new byte[tensor.remaining()];
+                tensor.get(drain);
+            }
+            long warmUs = (System.nanoTime() - warmStart) / 1000;
+            log("Warm-up done in " + warmUs + "us");
+
+            // Store session
             SessionState s = new SessionState();
             s.id            = nextSessionId++;
             s.model         = model;
@@ -232,12 +258,13 @@ public class DaemonService extends Service {
             ByteBuffer resp = ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN);
             resp.putInt(s.id);
             sendMsg(out, MSG_RESULT, resp.array());
-            log("Loaded session " + s.id);
-            modelFile.delete();
+            log("Session " + s.id + " ready");
 
         } catch (Exception e) {
-            log("Load failed: " + e);
+            log("Load FAILED: " + e.getClass().getSimpleName() + ": " + e.getMessage());
             sendError(out, "LOAD failed: " + e.getMessage());
+        } finally {
+            if (modelFile != null) modelFile.delete();
         }
     }
 
@@ -246,9 +273,10 @@ public class DaemonService extends Service {
         int sid = buf.getInt();
         int ni  = buf.getInt();
         SessionState s = sessions.get(sid);
-        if (s == null) { sendError(out, "unknown session"); return; }
+        if (s == null) { sendError(out, "INFER: unknown session " + sid); return; }
 
         try {
+            // Fill inputs
             for (int i = 0; i < ni; i++) {
                 int ilen = buf.getInt();
                 byte[] data = new byte[ilen];
@@ -258,14 +286,10 @@ public class DaemonService extends Service {
                 tensor.put(data);
             }
 
+            // Run
             s.model.run(s.inputBuffers, s.outputBuffers);
 
-            // Sync barrier: read first byte of output to ensure NPU completion
-            s.outputBuffers.get(0).rewind();
-            @SuppressWarnings("unused")
-            byte sync = s.outputBuffers.get(0).get();
-
-            // Pack outputs
+            // Pack outputs — reading all bytes acts as DMA drain
             int totalSize = 4;
             for (int i = 0; i < s.nOut; i++)
                 totalSize += 4 + (int) s.outSizes[i];
@@ -284,6 +308,7 @@ public class DaemonService extends Service {
             sendMsg(out, MSG_RESULT, resp.array());
 
         } catch (Exception e) {
+            log("Infer FAILED: " + e.getMessage());
             sendError(out, "INFER failed: " + e.getMessage());
         }
     }
@@ -292,28 +317,53 @@ public class DaemonService extends Service {
     private void handleBench(ByteBuffer buf, OutputStream out) throws IOException {
         int sid  = buf.getInt();
         int runs = buf.getInt();
+        if (runs <= 0 || runs > 10000) runs = 50;
         SessionState s = sessions.get(sid);
-        if (s == null) { sendError(out, "BENCH: unknown session"); return; }
+        if (s == null) { sendError(out, "BENCH: unknown session " + sid); return; }
 
         try {
+            int outBytes = (int) s.outSizes[0];
+            // Pre-allocate drain buffer outside loop to avoid GC pressure
+            byte[] drain = new byte[outBytes];
             long[] times = new long[runs];
+
+            log("Starting bench: " + runs + " runs, outBytes=" + outBytes);
+
             for (int r = 0; r < runs; r++) {
                 long t0 = System.nanoTime();
+
                 s.model.run(s.inputBuffers, s.outputBuffers);
-                // Sync barrier: block until NPU writes first output byte
-                s.outputBuffers.get(0).rewind();
-                @SuppressWarnings("unused")
-                byte sync = s.outputBuffers.get(0).get();
+
+                // Full output drain: copy all bytes from DMA buffer to heap array.
+                // This forces the JVM to wait for every byte the NPU wrote,
+                // acting as a real completion barrier.
+                ByteBuffer ob = s.outputBuffers.get(0);
+                ob.rewind();
+                ob.get(drain);  // blocks until all outBytes are readable
+
                 times[r] = (System.nanoTime() - t0) / 1000; // microseconds
             }
+
+            // Compute checksum of last run to verify model is producing output
+            int checksum = 0;
+            for (byte b : drain) checksum += (b & 0xFF);
+
+            // Stats
             long sum = 0;
             for (long t : times) sum += t;
             long avg = sum / runs;
             long var = 0;
             for (long t : times) var += (t - avg) * (t - avg);
             long std = (long) Math.sqrt((double) var / runs);
+            long min = times[0], max = times[0];
+            for (long t : times) { if (t < min) min = t; if (t > max) max = t; }
 
-            log("Bench " + runs + " runs: avg=" + avg + "us std=" + std + "us");
+            log("Bench " + runs + " runs:"
+                + " avg=" + avg + "us"
+                + " std=" + std + "us"
+                + " min=" + min + "us"
+                + " max=" + max + "us"
+                + " checksum=" + checksum);
 
             ByteBuffer resp = ByteBuffer.allocate(16).order(ByteOrder.LITTLE_ENDIAN);
             resp.putLong(avg);
@@ -321,6 +371,7 @@ public class DaemonService extends Service {
             sendMsg(out, MSG_RESULT, resp.array());
 
         } catch (Exception e) {
+            log("Bench FAILED: " + e.getMessage());
             sendError(out, "BENCH failed: " + e.getMessage());
         }
     }
@@ -336,6 +387,7 @@ public class DaemonService extends Service {
     }
 
     private void sendError(OutputStream out, String msg) {
+        log("Sending error: " + msg);
         try { sendMsg(out, MSG_ERROR, msg.getBytes()); } catch (Exception ignored) {}
     }
 
