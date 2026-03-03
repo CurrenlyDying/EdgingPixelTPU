@@ -13,9 +13,6 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: Unzip project
-        run: unzip phantom_apk.zip
-
       - name: Set up Java 17
         uses: actions/setup-java@v4
         with:
