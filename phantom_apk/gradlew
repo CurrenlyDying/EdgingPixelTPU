@@ -1,0 +1,8 @@
+#!/usr/bin/env sh
+# Gradle wrapper stub — Firebase Studio will use its own Gradle installation
+# If running locally, download gradle manually or let the IDE handle it
+
+GRADLE_OPTS="${GRADLE_OPTS:-}"
+APP_HOME="$(cd "$(dirname "$0")" && pwd -P)"
+
+exec java $GRADLE_OPTS -jar "$APP_HOME/gradle/wrapper/gradle-wrapper.jar" "$@"
