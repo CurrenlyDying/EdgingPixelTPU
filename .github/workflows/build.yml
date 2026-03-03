@@ -1,0 +1,54 @@
+name: Build Phantom NPU APK
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Unzip project
+        run: unzip phantom_apk.zip
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Make gradlew executable
+        run: chmod +x phantom_apk/gradlew
+
+      - name: Download Gradle wrapper jar
+        run: |
+          cd phantom_apk
+          wget -q https://services.gradle.org/distributions/gradle-8.6-bin.zip -O /tmp/gradle.zip
+          mkdir -p gradle/wrapper
+          # Extract just the wrapper jar from the distribution
+          unzip -j /tmp/gradle.zip "gradle-8.6/lib/gradle-wrapper*.jar" -d /tmp/gjars/ 2>/dev/null || true
+          # Fallback: download wrapper jar directly
+          curl -sL "https://raw.githubusercontent.com/gradle/gradle/v8.6.0/gradle/wrapper/gradle-wrapper.jar" \
+            -o gradle/wrapper/gradle-wrapper.jar 2>/dev/null || \
+          wget -q "https://github.com/gradle/gradle/raw/v8.6.0/gradle/wrapper/gradle-wrapper.jar" \
+            -O gradle/wrapper/gradle-wrapper.jar
+
+      - name: Build debug APK
+        run: |
+          cd phantom_apk
+          ./gradlew assembleDebug --no-daemon --stacktrace
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: phantom-npu-debug
+          path: phantom_apk/app/build/outputs/apk/debug/app-debug.apk
+          retention-days: 7
