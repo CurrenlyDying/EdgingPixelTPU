@@ -120,15 +120,7 @@ public class DaemonService extends Service {
             OutputStream out = sock.getOutputStream();
 
             while (true) {
-                int msgType = in.readInt();   // already big-endian from Java — wait
-                // Protocol is little-endian! Read as 4 raw bytes
-                // Actually re-read: we used readInt() which is big-endian
-                // We need to fix: read 8 bytes raw for header
-                // NOTE: header already consumed above — need to redo
-                // Let's just use raw reads from here
-                // Actually the problem: DataInputStream.readInt is big-endian
-                // but our C daemon sends little-endian.
-                // We handle this by reversing bytes:
+                int msgType = in.readInt();
                 msgType = Integer.reverseBytes(msgType);
                 int length = Integer.reverseBytes(in.readInt());
 
@@ -209,14 +201,12 @@ public class DaemonService extends Service {
         log("Loading model " + blobLen / 1024 + " KB, " + nIn + " in / " + nOut + " out");
 
         try {
-            // Write blob to cache file
             File modelFile = new File(getCacheDir(), "model_" + System.currentTimeMillis() + ".tflite");
             try (FileOutputStream fos = new FileOutputStream(modelFile)) { fos.write(blob); }
 
-            // LiteRT CompiledModel — automatically uses NPU via edgetpu_app_service
             LiteRtEnvironment env = LiteRtEnvironment.create();
             LiteRtOptions opts = new LiteRtOptions.Builder()
-                .setAccelerator(Accelerator.NPU)   // Tensor G4 EdgeTPU
+                .setAccelerator(Accelerator.NPU)
                 .build();
 
             CompiledModel model = CompiledModel.create(
@@ -270,6 +260,11 @@ public class DaemonService extends Service {
 
             s.model.run(s.inputBuffers, s.outputBuffers);
 
+            // Sync barrier: read first byte of output to ensure NPU completion
+            s.outputBuffers.get(0).rewind();
+            @SuppressWarnings("unused")
+            byte sync = s.outputBuffers.get(0).get();
+
             // Pack outputs
             int totalSize = 4;
             for (int i = 0; i < s.nOut; i++)
@@ -298,13 +293,17 @@ public class DaemonService extends Service {
         int sid  = buf.getInt();
         int runs = buf.getInt();
         SessionState s = sessions.get(sid);
-        if (s == null) { sendError(out, "unknown session"); return; }
+        if (s == null) { sendError(out, "BENCH: unknown session"); return; }
 
         try {
             long[] times = new long[runs];
             for (int r = 0; r < runs; r++) {
                 long t0 = System.nanoTime();
                 s.model.run(s.inputBuffers, s.outputBuffers);
+                // Sync barrier: block until NPU writes first output byte
+                s.outputBuffers.get(0).rewind();
+                @SuppressWarnings("unused")
+                byte sync = s.outputBuffers.get(0).get();
                 times[r] = (System.nanoTime() - t0) / 1000; // microseconds
             }
             long sum = 0;
