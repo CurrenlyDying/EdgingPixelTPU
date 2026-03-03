@@ -25,26 +25,17 @@ jobs:
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
 
-      - name: Make gradlew executable
-        run: chmod +x phantom_apk/gradlew
-
-      - name: Download Gradle wrapper jar
+      - name: Install Gradle 8.6 via sdkman
         run: |
-          cd phantom_apk
-          wget -q https://services.gradle.org/distributions/gradle-8.6-bin.zip -O /tmp/gradle.zip
-          mkdir -p gradle/wrapper
-          # Extract just the wrapper jar from the distribution
-          unzip -j /tmp/gradle.zip "gradle-8.6/lib/gradle-wrapper*.jar" -d /tmp/gjars/ 2>/dev/null || true
-          # Fallback: download wrapper jar directly
-          curl -sL "https://raw.githubusercontent.com/gradle/gradle/v8.6.0/gradle/wrapper/gradle-wrapper.jar" \
-            -o gradle/wrapper/gradle-wrapper.jar 2>/dev/null || \
-          wget -q "https://github.com/gradle/gradle/raw/v8.6.0/gradle/wrapper/gradle-wrapper.jar" \
-            -O gradle/wrapper/gradle-wrapper.jar
+          curl -s "https://get.sdkman.io" | bash
+          source "$HOME/.sdkman/bin/sdkman-init.sh"
+          sdk install gradle 8.6
+          echo "$HOME/.sdkman/candidates/gradle/8.6/bin" >> $GITHUB_PATH
 
       - name: Build debug APK
         run: |
           cd phantom_apk
-          ./gradlew assembleDebug --no-daemon --stacktrace
+          gradle assembleDebug --no-daemon --stacktrace
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
@@ -52,3 +43,4 @@ jobs:
           name: phantom-npu-debug
           path: phantom_apk/app/build/outputs/apk/debug/app-debug.apk
           retention-days: 7
+          
