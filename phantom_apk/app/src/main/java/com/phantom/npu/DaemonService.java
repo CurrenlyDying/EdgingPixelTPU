@@ -210,7 +210,10 @@ public class DaemonService extends Service {
                 // Log checksum of first output to confirm real execution
                 if (i == 0) {
                     int cs = 0; for (byte b : drain) cs += (b & 0xFF);
-                    log("Warm-up output[0] checksum=" + cs + "  (0 means NPU not executing)");
+                    log("Warm-up output[0] bufSize=" + drain.length
+                        + " checksum=" + cs
+                        + (cs == 0 ? "  *** ZERO" : "  OK")
+                        + "  declared=" + outSizes[0] + "B");
                 }
             }
             log("Warm-up done " + (System.nanoTime() - t0) / 1000 + "us");
@@ -283,11 +286,17 @@ public class DaemonService extends Service {
         if (s == null) { sendError(out, "BENCH: unknown session " + sid); return; }
 
         try {
-            int outBytes = (int) s.outSizes[0];
-            byte[] drain = new byte[outBytes];  // pre-allocated, reused each run
+            // Use actual LiteRT buffer capacity, NOT our declared outSizes.
+            // LiteRT may dequantize uint8->float32, making real buffer 4x larger.
+            ByteBuffer ob0first = s.outputBuffers.get(0);
+            int outBytes = ob0first.capacity();
+            byte[] drain = new byte[outBytes];
             long[] times = new long[runs];
 
-            log("Bench start: " + runs + " runs  outBytes=" + outBytes);
+            log("Bench start: " + runs + " runs"
+                + "  declared=" + s.outSizes[0] + "B"
+                + "  actual=" + outBytes + "B"
+                + (outBytes == (int)s.outSizes[0] * 4 ? " (float32 dequant!)" : ""));
 
             for (int r = 0; r < runs; r++) {
                 long t0 = System.nanoTime();
@@ -300,7 +309,7 @@ public class DaemonService extends Service {
                 // it cannot return until the NPU has finished writing.
                 ByteBuffer ob = s.outputBuffers.get(0);
                 ob.rewind();
-                ob.get(drain);   // blocks until NPU DMA is complete
+                ob.get(drain);  // full capacity drain = real sync barrier
                 // ─────────────────────────────────────────────────────────
 
                 times[r] = (System.nanoTime() - t0) / 1000; // microseconds
