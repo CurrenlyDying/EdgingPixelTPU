@@ -184,10 +184,13 @@ public class DaemonService extends Service {
             LiteRtEnvironment env = LiteRtEnvironment.create();
             log("LiteRtEnvironment OK: " + env);
 
+            // TEST: CPU first to confirm model.run() actually produces output.
+            // If checksum is non-zero on CPU, NPU delegation is the problem.
+            // If checksum is zero on CPU too, there is a fundamental API usage error.
             LiteRtOptions opts = new LiteRtOptions.Builder()
-                .setAccelerator(Accelerator.NPU)
+                .setAccelerator(Accelerator.CPU)
                 .build();
-            log("LiteRtOptions OK (Accelerator.NPU)");
+            log("LiteRtOptions OK (Accelerator.CPU — DIAGNOSTIC MODE)");
 
             long t0 = System.nanoTime();
             CompiledModel model = CompiledModel.create(env, modelFile.getAbsolutePath(), opts);
@@ -205,15 +208,18 @@ public class DaemonService extends Service {
             for (int i = 0; i < nOut; i++) {
                 ByteBuffer tensor = ob.get(i);
                 tensor.rewind();
-                byte[] drain = new byte[tensor.remaining()];
+                // Use limit() for the actual tensor size, not capacity() (backing pool)
+                int tensorBytes = tensor.limit();
+                byte[] drain = new byte[tensorBytes];
                 tensor.get(drain);
-                // Log checksum of first output to confirm real execution
                 if (i == 0) {
                     int cs = 0; for (byte b : drain) cs += (b & 0xFF);
-                    log("Warm-up output[0] bufSize=" + drain.length
+                    log("Warm-up output[0]"
+                        + " limit=" + tensorBytes
+                        + " capacity=" + tensor.capacity()
                         + " checksum=" + cs
-                        + (cs == 0 ? "  *** ZERO" : "  OK")
-                        + "  declared=" + outSizes[0] + "B");
+                        + (cs == 0 ? " *** ZERO" : " OK")
+                        + " declared=" + outSizes[0] + "B");
                 }
             }
             log("Warm-up done " + (System.nanoTime() - t0) / 1000 + "us");
@@ -289,14 +295,15 @@ public class DaemonService extends Service {
             // Use actual LiteRT buffer capacity, NOT our declared outSizes.
             // LiteRT may dequantize uint8->float32, making real buffer 4x larger.
             ByteBuffer ob0first = s.outputBuffers.get(0);
-            int outBytes = ob0first.capacity();
+            // limit() = actual tensor bytes; capacity() = whole backing pool (misleading)
+            int outBytes = ob0first.limit();
             byte[] drain = new byte[outBytes];
             long[] times = new long[runs];
 
             log("Bench start: " + runs + " runs"
-                + "  declared=" + s.outSizes[0] + "B"
-                + "  actual=" + outBytes + "B"
-                + (outBytes == (int)s.outSizes[0] * 4 ? " (float32 dequant!)" : ""));
+                + "  limit=" + outBytes + "B"
+                + "  capacity=" + ob0first.capacity() + "B"
+                + "  declared=" + s.outSizes[0] + "B");
 
             for (int r = 0; r < runs; r++) {
                 long t0 = System.nanoTime();
